@@ -1,0 +1,1357 @@
+#!/usr/bin/python3
+# sysmon: полноэкранный монитор этой машины
+# xeon e3-1230 v2, rx 580, nct6776, zram, sda + md0
+# датчики ищутся по name, индексы hwmon не зашиты
+# кулеры крутит готовый /usr/local/bin/fan, в sysfs отсюда не пишем
+
+import os
+import signal
+import subprocess
+import sys
+import time
+from collections import deque
+
+import psutil
+from blessed import Terminal
+
+INTERVAL = 1.0
+HIST = 240
+MIN_W, MIN_H = 80, 28
+PROC_CAP = 200
+FAN_BIN = "/usr/local/bin/fan"
+
+# палитра: тёмный фон терминала, белый текст, розовый акцент, зелёный только на норме
+PINK = 213
+PINK_DIM = 175
+GREEN = 71
+AMBER = 179
+WHITE = 252
+DIM = 242
+FRAME = 238
+TITLE = 252
+OK = GREEN
+WARN = AMBER
+HOT = 203
+ACCENT = PINK
+BAR_EMPTY = 236
+
+# нагрузка: тихое -> розовое, без радуги
+GRAD = (59, 96, 139, 175, 213, 212, 211, 210, 204, 203, 196)
+# температура: зелёный пока холодно, янтарь, красный на жаре
+TEMP_GRAD = (65, 71, 149, 179, 173, 167, 203, 196)
+
+BRAILLE = tuple(
+    chr(0x2800 | (1 << b))
+    for b in range(8)
+)
+# биты брайля в ячейке 2x4, сверху вниз, слева направо
+DOT = (0x01, 0x08, 0x02, 0x10, 0x04, 0x20, 0x40, 0x80)
+
+
+def read_text(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read().strip()
+    except OSError:
+        return None
+
+
+def read_int(path):
+    raw = read_text(path)
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def find_hwmon(name):
+    root = "/sys/class/hwmon"
+    try:
+        entries = sorted(os.listdir(root))
+    except OSError:
+        return None
+    for entry in entries:
+        path = os.path.join(root, entry)
+        if read_text(os.path.join(path, "name")) == name:
+            return path
+    return None
+
+
+def find_amdgpu():
+    """карта amdgpu: busy и vram лежат в device, термо в hwmon"""
+    drm = "/sys/class/drm"
+    try:
+        cards = sorted(n for n in os.listdir(drm) if n.startswith("card") and "-" not in n)
+    except OSError:
+        cards = []
+    for card in cards:
+        dev = os.path.join(drm, card, "device")
+        if read_text(os.path.join(dev, "uevent")) and "DRIVER=amdgpu" in (read_text(os.path.join(dev, "uevent")) or ""):
+            hw = None
+            hwroot = os.path.join(dev, "hwmon")
+            try:
+                for sub in os.listdir(hwroot):
+                    cand = os.path.join(hwroot, sub)
+                    if read_text(os.path.join(cand, "name")) == "amdgpu":
+                        hw = cand
+                        break
+            except OSError:
+                hw = None
+            return dev, hw
+    hw = find_hwmon("amdgpu")
+    return None, hw
+
+
+def temp_c(path, name):
+    """миллиградусы -> градусы, отсутствие файла это не ноль"""
+    base = os.path.join(path, name)
+    raw = read_int(base + "_input")
+    if raw is None:
+        return None
+    # pch на этой плате отдаёт 0 когда датчика нет
+    label = read_text(base + "_label") or ""
+    if raw == 0 and label.startswith("PCH_"):
+        return None
+    return raw / 1000.0
+
+
+def color_load(term, pct):
+    if pct is None:
+        return term.color(DIM)
+    pct = max(0.0, min(100.0, pct))
+    idx = min(len(GRAD) - 1, int(pct / 100.0 * (len(GRAD) - 1)))
+    return term.color(GRAD[idx])
+
+
+def color_temp(term, celsius):
+    if celsius is None:
+        return term.color(DIM)
+    # до 45 спокойно, от 75 уже жарко, 90+ красный
+    stops = (40, 50, 60, 70, 78, 85, 92)
+    idx = 0
+    for edge in stops:
+        if celsius >= edge:
+            idx += 1
+    return term.color(TEMP_GRAD[min(idx, len(TEMP_GRAD) - 1)])
+
+
+def fmt_temp(value):
+    if value is None:
+        return "нет"
+    return f"{value:4.0f}°"
+
+
+def fmt_bytes(n):
+    if n is None:
+        return "нет"
+    n = float(n)
+    for unit in ("б", "к", "м", "г", "т"):
+        if abs(n) < 1024 or unit == "т":
+            if unit == "б":
+                return f"{n:.0f}{unit}"
+            return f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}т"
+
+
+def fmt_rate(n):
+    if n is None:
+        return "нет"
+    return fmt_bytes(n) + "/с"
+
+
+def fmt_hz(hz):
+    if hz is None:
+        return "нет"
+    return f"{hz / 1e9:.2f}ггц"
+
+
+def clip(text, width):
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text
+    if width == 1:
+        return text[:1]
+    return text[: width - 1] + "…"
+
+
+def pad(text, width, align="left"):
+    text = clip(text, width)
+    gap = width - len(text)
+    if align == "right":
+        return " " * gap + text
+    if align == "center":
+        left = gap // 2
+        return " " * left + text + " " * (gap - left)
+    return text + " " * gap
+
+
+class Ring:
+    def __init__(self, n):
+        self.data = deque(maxlen=n)
+
+    def push(self, value):
+        self.data.append(value)
+
+    def values(self, width):
+        vals = list(self.data)
+        if len(vals) >= width:
+            return vals[-width:]
+        return [None] * (width - len(vals)) + vals
+
+
+class Sampler:
+    def __init__(self):
+        self.coretemp = find_hwmon("coretemp")
+        self.nct = find_hwmon("nct6776")
+        if self.nct is None:
+            self.nct = find_hwmon("nct6775")
+        self.gpu_dev, self.gpu_hw = find_amdgpu()
+        self.cpu_hist = Ring(HIST)
+        self.net_hist = Ring(HIST)
+        self.disk_hist = {"sda": Ring(HIST), "md0": Ring(HIST)}
+        self.gpu_hist = Ring(HIST)
+        self.prev_cpu = None
+        self.prev_net = None
+        self.prev_disk = None
+        self.prev_proc = {}
+        self.prev_ts = None
+        self.fans_cache = ""
+        self.fans_ts = 0.0
+        self.snap = None
+
+    def _cpu_times(self):
+        lines = read_text("/proc/stat")
+        if not lines:
+            return None, None
+        total = None
+        cores = []
+        for line in lines.splitlines():
+            if line.startswith("cpu "):
+                parts = [int(x) for x in line.split()[1:]]
+                idle = parts[3] + (parts[4] if len(parts) > 4 else 0)
+                total = (sum(parts), idle)
+            elif line.startswith("cpu"):
+                parts = [int(x) for x in line.split()[1:]]
+                idle = parts[3] + (parts[4] if len(parts) > 4 else 0)
+                cores.append((sum(parts), idle))
+        return total, cores
+
+    def _freqs(self):
+        out = []
+        for i in range(psutil.cpu_count(logical=True) or 0):
+            base = f"/sys/devices/system/cpu/cpu{i}/cpufreq/scaling_cur_freq"
+            khz = read_int(base)
+            out.append(None if khz is None else khz * 1000)
+        return out
+
+    def _mem(self):
+        info = {}
+        raw = read_text("/proc/meminfo") or ""
+        for line in raw.splitlines():
+            key, _, rest = line.partition(":")
+            try:
+                info[key] = int(rest.strip().split()[0]) * 1024
+            except (ValueError, IndexError):
+                continue
+        total = info.get("MemTotal")
+        avail = info.get("MemAvailable")
+        used = None if total is None or avail is None else total - avail
+        swap_total = info.get("SwapTotal")
+        swap_free = info.get("SwapFree")
+        swap_used = None if swap_total is None or swap_free is None else swap_total - swap_free
+        zram = self._zram()
+        file_swap = self._file_swap(swap_used, zram)
+        return {
+            "total": total,
+            "used": used,
+            "avail": avail,
+            "swap_total": swap_total,
+            "swap_used": swap_used,
+            "zram": zram,
+            "file_swap": file_swap,
+        }
+
+    def _zram(self):
+        path = "/sys/block/zram0/mm_stat"
+        raw = read_text(path)
+        if not raw:
+            return None
+        parts = raw.split()
+        if len(parts) < 3:
+            return None
+        try:
+            orig, compr, mem = int(parts[0]), int(parts[1]), int(parts[2])
+        except ValueError:
+            return None
+        disk = read_int("/sys/block/zram0/disksize")
+        algo = read_text("/sys/block/zram0/comp_algorithm") or ""
+        current = ""
+        for token in algo.split():
+            if token.startswith("[") and token.endswith("]"):
+                current = token[1:-1]
+                break
+        return {
+            "orig": orig,
+            "compr": compr,
+            "mem": mem,
+            "disk": disk,
+            "algo": current or "нет",
+            "ratio": (orig / compr) if compr else None,
+        }
+
+    def _file_swap(self, swap_used, zram):
+        """файловый своп отдельно от zram: /proc/swaps"""
+        raw = read_text("/proc/swaps")
+        if not raw:
+            return None
+        files = []
+        zram_used = 0
+        for line in raw.splitlines()[1:]:
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            name, _, size, used = parts[0], parts[1], parts[2], parts[3]
+            try:
+                size_b, used_b = int(size) * 1024, int(used) * 1024
+            except ValueError:
+                continue
+            if "zram" in name:
+                zram_used += used_b
+            else:
+                files.append((os.path.basename(name), size_b, used_b))
+        return files
+
+    def _disks(self, now):
+        raw = read_text("/proc/diskstats") or ""
+        want = {"sda", "md0"}
+        cur = {}
+        for line in raw.splitlines():
+            parts = line.split()
+            if len(parts) < 14:
+                continue
+            name = parts[2]
+            if name not in want:
+                continue
+            # поля: read_ios, read_sectors, write_ios, write_sectors
+            try:
+                rd_sec = int(parts[5])
+                wr_sec = int(parts[9])
+            except ValueError:
+                continue
+            cur[name] = (rd_sec, wr_sec)
+        rates = {}
+        dt = None if self.prev_ts is None else max(now - self.prev_ts, 0.001)
+        for name, (rd, wr) in cur.items():
+            if self.prev_disk and name in self.prev_disk and dt:
+                prd, pwr = self.prev_disk[name]
+                rrate = max(0, (rd - prd) * 512 / dt)
+                wrate = max(0, (wr - pwr) * 512 / dt)
+            else:
+                rrate = wrate = None
+            rates[name] = (rrate, wrate)
+            total = None if rrate is None else rrate + wrate
+            self.disk_hist[name].push(total)
+        self.prev_disk = cur
+        usage = {}
+        for name, mount in (("sda", None), ("md0", "/media/raid0")):
+            usage[name] = self._usage_for(name, mount)
+        return rates, usage
+
+    def _usage_for(self, name, mount):
+        mounts = []
+        if name == "sda":
+            mounts = [("/", "sda2", "/"), ("/home", "sda3", "/home"), ("/boot", "sda1", "/boot")]
+        elif mount:
+            mounts = [(mount, "md0", mount)]
+        out = []
+        for label, part, path in mounts:
+            try:
+                st = os.statvfs(path)
+            except OSError:
+                out.append((label, part, None, None))
+                continue
+            total = st.f_blocks * st.f_frsize
+            free = st.f_bavail * st.f_frsize
+            used = total - (st.f_bfree * st.f_frsize)
+            out.append((label, part, total, used))
+        return out
+
+    def _net(self, now):
+        raw = read_text("/proc/net/dev") or ""
+        cur = {}
+        for line in raw.splitlines():
+            if ":" not in line:
+                continue
+            name, rest = line.split(":", 1)
+            name = name.strip()
+            if name == "lo":
+                continue
+            parts = rest.split()
+            if len(parts) < 9:
+                continue
+            try:
+                rx, tx = int(parts[0]), int(parts[8])
+            except ValueError:
+                continue
+            cur[name] = (rx, tx)
+        dt = None if self.prev_ts is None else max(now - self.prev_ts, 0.001)
+        rates = {}
+        total_rx = total_tx = 0.0
+        have = False
+        for name, (rx, tx) in cur.items():
+            if self.prev_net and name in self.prev_net and dt:
+                prx, ptx = self.prev_net[name]
+                rrate = max(0.0, (rx - prx) / dt)
+                trate = max(0.0, (tx - ptx) / dt)
+                have = True
+            else:
+                rrate = trate = None
+            rates[name] = (rrate, trate)
+            if rrate is not None:
+                total_rx += rrate
+                total_tx += trate
+        self.prev_net = cur
+        self.net_hist.push(None if not have else total_rx + total_tx)
+        return rates, (None if not have else total_rx), (None if not have else total_tx)
+
+    def _temps(self):
+        cores = []
+        package = None
+        if self.coretemp:
+            package = temp_c(self.coretemp, "temp1")
+            for i in range(2, 8):
+                label = read_text(os.path.join(self.coretemp, f"temp{i}_label"))
+                if not label:
+                    continue
+                cores.append((label, temp_c(self.coretemp, f"temp{i}")))
+        board = []
+        if self.nct:
+            for i in range(1, 12):
+                label = read_text(os.path.join(self.nct, f"temp{i}_label"))
+                if not label:
+                    continue
+                value = temp_c(self.nct, f"temp{i}")
+                if value is None:
+                    continue
+                board.append((label, value))
+        gpu = None
+        gpu_crit = None
+        if self.gpu_hw:
+            gpu = temp_c(self.gpu_hw, "temp1")
+            crit = read_int(os.path.join(self.gpu_hw, "temp1_crit"))
+            gpu_crit = None if crit is None else crit / 1000.0
+        return {
+            "package": package,
+            "cores": cores,
+            "board": board,
+            "gpu": gpu,
+            "gpu_crit": gpu_crit,
+        }
+
+    def _gpu(self):
+        dev, hw = self.gpu_dev, self.gpu_hw
+        if dev is None and hw is None:
+            return None
+        busy = read_int(os.path.join(dev, "gpu_busy_percent")) if dev else None
+        mem_busy = read_int(os.path.join(dev, "mem_busy_percent")) if dev else None
+        vram_total = read_int(os.path.join(dev, "mem_info_vram_total")) if dev else None
+        vram_used = read_int(os.path.join(dev, "mem_info_vram_used")) if dev else None
+        power = None
+        fan = None
+        pwm = None
+        sclk = None
+        mclk = None
+        if hw:
+            uw = read_int(os.path.join(hw, "power1_input"))
+            power = None if uw is None else uw / 1e6
+            fan = read_int(os.path.join(hw, "fan1_input"))
+            pwm = read_int(os.path.join(hw, "pwm1"))
+            sclk = read_int(os.path.join(hw, "freq1_input"))
+            mclk = read_int(os.path.join(hw, "freq2_input"))
+        self.gpu_hist.push(None if busy is None else float(busy))
+        return {
+            "busy": busy,
+            "mem_busy": mem_busy,
+            "vram_total": vram_total,
+            "vram_used": vram_used,
+            "power": power,
+            "fan": fan,
+            "pwm": pwm,
+            "sclk": sclk,
+            "mclk": mclk,
+        }
+
+    def _board_fans(self):
+        """только чтение оборотов, управление через fan"""
+        if not self.nct:
+            return []
+        out = []
+        labels = {1: "cpu", 2: "case1", 3: "case2", 4: "fan4", 5: "fan5"}
+        for i in range(1, 6):
+            path = os.path.join(self.nct, f"fan{i}_input")
+            if not os.path.exists(path):
+                continue
+            rpm = read_int(path)
+            pwm = read_int(os.path.join(self.nct, f"pwm{i}"))
+            mode = read_int(os.path.join(self.nct, f"pwm{i}_enable"))
+            out.append((labels.get(i, f"fan{i}"), rpm, pwm, mode))
+        return out
+
+    def _procs(self, now):
+        rows = []
+        dt = None if self.prev_ts is None else max(now - self.prev_ts, 0.001)
+        seen = {}
+        for proc in psutil.process_iter(["pid", "name", "memory_info", "cpu_times"]):
+            try:
+                info = proc.info
+                pid = info["pid"]
+                times = info["cpu_times"]
+                if times is None:
+                    continue
+                cpu_ticks = times.user + times.system
+                mem = info["memory_info"].rss if info["memory_info"] else 0
+            except (psutil.Error, AttributeError):
+                continue
+            prev = self.prev_proc.get(pid)
+            cpu = None
+            if prev is not None and dt:
+                cpu = max(0.0, (cpu_ticks - prev[0]) / dt * 100.0)
+            seen[pid] = (cpu_ticks, mem)
+            name = info["name"] or "?"
+            rows.append({
+                "pid": pid,
+                "name": name,
+                "cpu": cpu,
+                "mem": mem,
+            })
+        self.prev_proc = seen
+        return rows
+
+    def sample(self):
+        now = time.monotonic()
+        total, cores = self._cpu_times()
+        cpu_pct = None
+        core_pct = [None] * (len(cores) if cores else 0)
+        if total and self.prev_cpu and self.prev_ts:
+            dt_total = total[0] - self.prev_cpu[0][0]
+            if dt_total > 0:
+                cpu_pct = (1.0 - (total[1] - self.prev_cpu[0][1]) / dt_total) * 100.0
+            core_pct = []
+            for idx, core in enumerate(cores):
+                prev = self.prev_cpu[1][idx]
+                delta = core[0] - prev[0]
+                if delta > 0:
+                    core_pct.append((1.0 - (core[1] - prev[1]) / delta) * 100.0)
+                else:
+                    core_pct.append(0.0)
+        self.prev_cpu = (total, cores)
+        self.cpu_hist.push(cpu_pct)
+        mem = self._mem()
+        disk_rates, disk_usage = self._disks(now)
+        net_rates, rx, tx = self._net(now)
+        temps = self._temps()
+        gpu = self._gpu()
+        fans = self._board_fans()
+        procs = self._procs(now)
+        freqs = self._freqs()
+        self.prev_ts = now
+        self.snap = {
+            "cpu": cpu_pct,
+            "cores": core_pct,
+            "freqs": freqs,
+            "mem": mem,
+            "disks": disk_rates,
+            "disk_usage": disk_usage,
+            "net": net_rates,
+            "net_rx": rx,
+            "net_tx": tx,
+            "temps": temps,
+            "gpu": gpu,
+            "fans": fans,
+            "procs": procs,
+            "load": os.getloadavg(),
+        }
+        return self.snap
+
+
+def braille_chart(values, width, height, vmax=None):
+    """values слева направо, высота в символах. каждая клетка 2x4 точки"""
+    cols = width * 2
+    rows = height * 4
+    if width <= 0 or height <= 0:
+        return []
+    series = list(values)
+    if len(series) < cols:
+        series = [None] * (cols - len(series)) + series
+    else:
+        series = series[-cols:]
+    nums = [v for v in series if v is not None]
+    top = vmax
+    if top is None:
+        top = max(nums) if nums else 1.0
+    if top <= 0:
+        top = 1.0
+    grid = [[False] * cols for _ in range(rows)]
+    for x, value in enumerate(series):
+        if value is None:
+            continue
+        level = int(round(max(0.0, min(1.0, value / top)) * (rows - 1)))
+        for y in range(rows - 1 - level, rows):
+            grid[y][x] = True
+    lines = []
+    for cy in range(height):
+        chars = []
+        for cx in range(width):
+            bits = 0
+            for dy in range(4):
+                for dx in range(2):
+                    if grid[cy * 4 + dy][cx * 2 + dx]:
+                        bits |= DOT[dy * 2 + dx]
+            chars.append(chr(0x2800 | bits))
+        lines.append("".join(chars))
+    return lines
+
+
+def hbar(term, pct, width):
+    if width <= 0:
+        return ""
+    if pct is None:
+        return term.color(DIM) + "·" * width + term.normal
+    pct = max(0.0, min(100.0, pct))
+    filled = int(round(pct / 100.0 * width))
+    return (
+        color_load(term, pct) + "━" * filled
+        + term.color(BAR_EMPTY) + "─" * (width - filled)
+        + term.normal
+    )
+
+
+def box(title, width):
+    inner = width - 2
+    label = " " + title + " "
+    if len(label) > inner:
+        label = " " + clip(title, inner - 2) + " "
+    right = inner - len(label)
+    return "╭" + label + "─" * right + "╮"
+
+
+def bottom(width):
+    return "╰" + "─" * (width - 2) + "╯"
+
+
+def row(text, width):
+    # text может содержать ansi, длина считается по видимому
+    return "│" + text + "│"
+
+
+class App:
+    def __init__(self):
+        self.term = Terminal()
+        self.sampler = Sampler()
+        self.sort = "cpu"  # cpu | mem | name
+        self.sort_rev = True
+        self.filter = ""
+        self.filtering = False
+        self.help = False
+        self.selected = 0
+        self.scroll = 0
+        self.confirm = None  # (pid, name)
+        self.fan_target = "cpu"
+        self.fan_level = {"cpu": None, "case": None, "gpu": None}
+        self.zones = []
+        self.sort_cols = {}
+        self.message = ""
+        self.message_until = 0.0
+        self.quit = False
+        self.proc_view = []
+
+    def note(self, text):
+        self.message = text
+        self.message_until = time.monotonic() + 3.0
+
+    def visible_procs(self):
+        rows = self.sampler.snap["procs"] if self.sampler.snap else []
+        if self.filter:
+            needle = self.filter.lower()
+            rows = [r for r in rows if needle in r["name"].lower() or needle in str(r["pid"])]
+        key = {
+            "cpu": lambda r: -1 if r["cpu"] is None else r["cpu"],
+            "mem": lambda r: r["mem"],
+            "name": lambda r: r["name"].lower(),
+        }[self.sort]
+        # один проход. второй раньше переписывал порядок и список сам прыгал
+        return sorted(rows, key=key, reverse=self.sort_rev)[:PROC_CAP]
+
+    def layout(self):
+        w, h = self.term.width, self.term.height
+        # слева cpu+gpu, справа память/диски/сеть/тепло. процессы снизу на всю ширину
+        right = 52 if w >= 120 else 46
+        if w - right < 50:
+            right = max(40, w // 2)
+        left = w - right
+        # шапка и подвал. низ делится: процессы слева, кулеры справа на пустом месте
+        top_h = h - 1 - 2
+        proc_h = max(9, min(11, top_h * 2 // 5))
+        top_h -= proc_h
+        gpu_h = 8 if top_h >= 18 else 0
+        cpu_h = top_h - gpu_h
+        mem_h, disk_h, net_h = 6, 8, 5
+        therm_h = top_h - (mem_h + disk_h + net_h)
+        fan_w = max(46, w // 3)
+        proc_w = w - fan_w
+        return {
+            "w": w, "h": h, "left": left, "right": right,
+            "top_h": top_h, "proc_h": proc_h, "proc_w": proc_w, "fan_w": fan_w,
+            "cpu_h": cpu_h, "gpu_h": gpu_h,
+            "mem_h": mem_h, "disk_h": disk_h, "net_h": net_h, "therm_h": therm_h,
+        }
+
+    def paint(self):
+        term = self.term
+        snap = self.sampler.snap
+        lay = self.layout()
+        w, h = lay["w"], lay["h"]
+        if w < MIN_W or h < MIN_H:
+            buf = term.home + term.clear
+            msg = f"окно {w}x{h}, нужно хотя бы {MIN_W}x{MIN_H}"
+            buf += term.move_yx(h // 2, max(0, (w - len(msg)) // 2)) + msg
+            buf += term.move_yx(h // 2 + 1, max(0, (w - 12) // 2)) + "q выход"
+            sys.stdout.write(buf)
+            sys.stdout.flush()
+            return
+        out = [term.home]
+        out.append(self.header(lay))
+        out.append(self.top(lay, snap))
+        out.append(self.procs(lay, snap))
+        out.append(self.fans(lay, snap))
+        out.append(self.footer(lay))
+        if self.help:
+            out.append(self.help_overlay(lay))
+        if self.confirm:
+            out.append(self.confirm_overlay(lay))
+        sys.stdout.write("".join(out))
+        sys.stdout.flush()
+
+    def header(self, lay):
+        term = self.term
+        snap = self.sampler.snap
+        load = snap["load"]
+        host = os.uname().nodename
+        text = f"  sysmon     {host}     xeon e3-1230 v2     rx 580     load  {load[0]:.2f}  {load[1]:.2f}  {load[2]:.2f}"
+        clock = time.strftime("  %H:%M:%S")
+        gap = lay["w"] - len(text) - len(clock)
+        if gap < 1:
+            text = clip(text, lay["w"] - len(clock))
+            gap = 0
+        line = term.color(PINK) + " ●" + term.color(WHITE) + text[2:] + term.normal + " " * gap + term.color(DIM) + clock + term.normal
+        return term.move_yx(0, 0) + line
+
+    def top(self, lay, snap):
+        left_lines = self.left_panel(lay["left"], lay["top_h"], snap, lay)
+        right_lines = self.right_panel(lay["right"], lay["top_h"], snap, lay)
+        out = []
+        y0 = 1
+        for i in range(lay["top_h"]):
+            left = left_lines[i] if i < len(left_lines) else " " * lay["left"]
+            right = right_lines[i] if i < len(right_lines) else " " * lay["right"]
+            out.append(self.term.move_yx(y0 + i, 0) + left + right)
+        return "".join(out)
+
+    def frame_lines(self, width, height, title, body_lines):
+        """body_lines уже видимой ширины width-2, без ansi-учёта: красим снаружи"""
+        term = self.term
+        lines = []
+        title_bar = box(title, width)
+        lines.append(term.color(FRAME) + title_bar + term.normal)
+        inner_h = height - 2
+        for i in range(inner_h):
+            content = body_lines[i] if i < len(body_lines) else ""
+            # content может нести ansi, добиваем пробелами по видимой длине
+            visible = ansi_len(content)
+            pad_n = max(0, width - 4 - visible)
+            lines.append(term.color(FRAME) + "│ " + term.normal + content + " " * pad_n + term.color(FRAME) + " │" + term.normal)
+        lines.append(term.color(FRAME) + bottom(width) + term.normal)
+        return lines[:height]
+
+    def left_panel(self, width, height, snap, lay):
+        lines = self.cpu_block(width, lay["cpu_h"], snap)
+        if lay["gpu_h"]:
+            lines += self.gpu_block(width, lay["gpu_h"], snap)
+        if len(lines) < height:
+            lines += [" " * width] * (height - len(lines))
+        return lines[:height]
+
+    def cpu_block(self, width, height, snap):
+        term = self.term
+        inner = width - 4
+        body = []
+        cores = snap["cores"]
+        freqs = snap["freqs"]
+        pairs = [(0, 4), (1, 5), (2, 6), (3, 7)]
+        freq_w = 7
+        # номер 2 + пробел + бар + пробел + процент 4 + зазор 2, и то же на второй поток
+        bar_w = max(3, (inner - freq_w - 1 - 2 * (2 + 1 + 1 + 4 + 2)) // 2)
+        for a, b in pairs:
+            pa = cores[a] if a < len(cores) else None
+            pb = cores[b] if b < len(cores) else None
+            fa = freqs[a] if a < len(freqs) else None
+            fb = freqs[b] if b < len(freqs) else None
+            freq = fa if fa is not None else fb
+            line = (
+                term.color(DIM) + pad(f"{a}", 2, "right") + term.normal
+                + " " + hbar(term, pa, bar_w) + " "
+                + color_load(term, pa) + pad(fmt_pct(pa), 4, "right") + term.normal
+                + "  "
+                + term.color(DIM) + pad(f"{b}", 2, "right") + term.normal
+                + " " + hbar(term, pb, bar_w) + " "
+                + color_load(term, pb) + pad(fmt_pct(pb), 4, "right") + term.normal
+                + " " + term.color(DIM) + pad(fmt_hz(freq), freq_w, "right") + term.normal
+            )
+            body.append(line)
+        total = snap["cpu"]
+        hottest = self.hottest_cpu(snap)
+        temp_s = fmt_temp(hottest)
+        summary = (
+            term.color(WHITE) + "cpu" + term.normal
+            + " " + hbar(term, total, max(4, inner - 18)) + " "
+            + color_load(term, total) + pad(fmt_pct(total), 5, "right") + term.normal
+            + "  " + color_temp(term, hottest) + pad(temp_s, 5, "right") + term.normal
+        )
+        body.append(summary)
+        chart_h = height - 2 - len(body)
+        chart = braille_chart(self.sampler.cpu_hist.values(inner * 2), inner, chart_h, vmax=100)
+        tone = color_load(term, total if total is not None else 0)
+        for line in chart:
+            body.append(tone + line + term.normal)
+        return self.frame_lines(width, height, "cpu", body)
+
+    def hottest_cpu(self, snap):
+        """одно число: самое горячее из пакета и ядер, плата справа не дублируется"""
+        temps = snap["temps"]
+        values = []
+        if temps["package"] is not None:
+            values.append(temps["package"])
+        for _label, value in temps["cores"]:
+            if value is not None:
+                values.append(value)
+        return max(values) if values else None
+
+    def gpu_block(self, width, height, snap):
+        term = self.term
+        inner = width - 4
+        gpu = snap["gpu"]
+        temps = snap["temps"]
+        body = []
+        if gpu is None:
+            body.append(term.color(DIM) + "amdgpu не найден" + term.normal)
+            return self.frame_lines(width, height, "gpu  rx 580", body)
+        busy = None if gpu["busy"] is None else float(gpu["busy"])
+        vram_pct = None
+        if gpu["vram_total"] and gpu["vram_used"] is not None and gpu["vram_total"] > 0:
+            vram_pct = gpu["vram_used"] / gpu["vram_total"] * 100.0
+        body.append(self.labeled(term, "gpu", busy, inner, 5, fmt_pct(busy), 5))
+        body.append(self.labeled(
+            term, "vram", vram_pct, inner, 5,
+            f"{fmt_bytes(gpu['vram_used'])} / {fmt_bytes(gpu['vram_total'])}", 16,
+        ))
+        edge = temps["gpu"]
+        power = "нет" if gpu["power"] is None else f"{gpu['power']:.0f} вт"
+        fan = "нет" if gpu["fan"] is None else f"{gpu['fan']} об"
+        pwm = "" if gpu["pwm"] is None else f"  {gpu['pwm'] * 100 // 255}%"
+        meta = (
+            color_temp(term, edge) + pad(fmt_temp(edge), 5) + term.normal
+            + "   " + term.color(WHITE) + pad(power, 6) + term.normal
+            + "   " + term.color(DIM) + "fan" + term.normal + " " + pad(fan + pwm, 12)
+            + "   " + term.color(DIM) + pad(fmt_hz(gpu["sclk"]), 7) + "  " + pad(fmt_hz(gpu["mclk"]), 7) + term.normal
+        )
+        body.append(meta)
+        chart_h = max(1, height - 2 - len(body))
+        chart = braille_chart(self.sampler.gpu_hist.values(inner * 2), inner, chart_h, vmax=100)
+        tone = color_load(term, busy if busy is not None else 0)
+        for line in chart:
+            body.append(tone + line + term.normal)
+        return self.frame_lines(width, height, "gpu  rx 580", body)
+
+    def labeled(self, term, name, pct, inner, name_w, value, value_w):
+        """подпись, бар и значение одной ровной строкой"""
+        bar_w = max(4, inner - name_w - value_w - 2)
+        return (
+            term.color(DIM) + pad(name, name_w) + term.normal
+            + hbar(term, pct, bar_w) + " "
+            + color_load(term, pct) + pad(value, value_w, "right") + term.normal
+        )
+
+    def right_panel(self, width, height, snap, lay):
+        blocks = [
+            self.mem_block(width, lay["mem_h"], snap),
+            self.disk_block(width, lay["disk_h"], snap),
+            self.net_block(width, lay["net_h"], snap),
+            self.thermal_block(width, lay["therm_h"], snap),
+        ]
+        lines = []
+        for block in blocks:
+            lines.extend(block)
+        if len(lines) < height:
+            lines += [" " * width] * (height - len(lines))
+        return lines[:height]
+
+    def mem_block(self, width, height, snap):
+        term = self.term
+        inner = width - 4
+        mem = snap["mem"]
+        body = []
+        pct = None
+        if mem["total"] and mem["used"] is not None and mem["total"] > 0:
+            pct = mem["used"] / mem["total"] * 100.0
+        body.append(self.labeled(term, "ram", pct, inner, 5, f"{fmt_bytes(mem['used'])} / {fmt_bytes(mem['total'])}", 14))
+        zram = mem["zram"]
+        if zram is None:
+            body.append(term.color(DIM) + "zram  нет" + term.normal)
+        else:
+            zp = zram["orig"] / zram["disk"] * 100.0 if zram["disk"] else None
+            ratio = "нет" if not zram["ratio"] else f"x{zram['ratio']:.1f}"
+            body.append(self.labeled(term, "zram", zp, inner, 5, f"{fmt_bytes(zram['orig'])}  {ratio}", 14))
+            body.append(term.color(DIM) + pad(f"сжато {fmt_bytes(zram['compr'])}    занято {fmt_bytes(zram['mem'])}", inner) + term.normal)
+        files = mem["file_swap"] or []
+        if files:
+            name, size, used = files[0]
+            fp = used / size * 100.0 if size else None
+            body.append(self.labeled(term, "swap", fp, inner, 5, f"{fmt_bytes(used)} / {fmt_bytes(size)}", 14))
+        else:
+            body.append(term.color(DIM) + "swap  нет" + term.normal)
+        return self.frame_lines(width, height, "память", body)
+
+    def disk_block(self, width, height, snap):
+        term = self.term
+        inner = width - 4
+        body = []
+        for name, short in (("sda", "ssd"), ("md0", "raid")):
+            rd, wr = snap["disks"].get(name, (None, None))
+            body.append(
+                term.color(WHITE) + pad(short, 4) + term.normal
+                + "  " + term.color(GREEN) + "r" + term.normal + " " + pad(fmt_rate(rd), 8)
+                + "   " + term.color(PINK) + "w" + term.normal + " " + pad(fmt_rate(wr), 8)
+            )
+            for label_m, part, total, used in snap["disk_usage"].get(name, []):
+                if total is None:
+                    body.append(term.color(DIM) + f"{part}  нет" + term.normal)
+                    continue
+                pct = used / total * 100.0 if total else None
+                tag = "raid0" if name == "md0" else label_m
+                body.append(self.labeled(term, tag, pct, inner, 6, fmt_pct(pct), 4))
+        return self.frame_lines(width, height, "диски", body)
+
+    def net_block(self, width, height, snap):
+        term = self.term
+        inner = width - 4
+        body = []
+        names = sorted(snap["net"], key=lambda n: (0 if n.startswith("en") else 1, n))
+        for name in names[:2]:
+            rx, tx = snap["net"][name]
+            body.append(
+                term.color(WHITE) + pad(name, 11) + term.normal
+                + "  " + term.color(GREEN) + "↓" + term.normal + " " + pad(fmt_rate(rx), 8)
+                + "   " + term.color(PINK) + "↑" + term.normal + " " + pad(fmt_rate(tx), 8)
+            )
+        chart_h = max(1, height - 2 - len(body))
+        chart = braille_chart(self.sampler.net_hist.values(inner * 2), inner, chart_h, vmax=None)
+        for line in chart:
+            body.append(term.color(PINK_DIM) + line + term.normal)
+        return self.frame_lines(width, height, "сеть", body)
+
+    def thermal_block(self, width, height, snap):
+        term = self.term
+        inner = width - 4
+        temps = snap["temps"]
+        chips = [("pkg", temps["package"])]
+        for label, value in temps["cores"]:
+            chips.append((label.replace("Core ", "c"), value))
+        for label, value in temps["board"]:
+            if label in {"SYSTIN": "sys", "CPUTIN": "сокет", "AUXTIN": "aux"}:
+                chips.append(({"SYSTIN": "sys", "CPUTIN": "сокет", "AUXTIN": "aux"}[label], value))
+        cell_w = max(10, (inner - 4) // 2)
+        body = []
+        pair = []
+        for label, value in chips:
+            pair.append(color_temp(term, value) + pad(f"{label}  {fmt_temp(value)}", cell_w) + term.normal)
+            if len(pair) == 2:
+                body.append(pair[0] + "    " + pair[1])
+                pair = []
+        if pair:
+            body.append(pair[0])
+        return self.frame_lines(width, height, "температуры", body)
+
+    def slider(self, term, level, width):
+        if level is None:
+            return term.color(BAR_EMPTY) + "─" * width + term.normal
+        filled = max(0, min(width, round(level / 100 * width)))
+        head = "●" if filled else ""
+        bar = "─" * max(0, filled - 1) + head
+        return term.color(PINK) + pad(bar, filled) + term.color(BAR_EMPTY) + "─" * (width - filled) + term.normal
+
+    def procs(self, lay, snap):
+        term = self.term
+        width = lay["proc_w"]
+        height = lay["proc_h"]
+        y0 = 1 + lay["top_h"]
+        rows = self.visible_procs()
+        self.proc_view = rows
+        inner = width - 4
+        if self.selected >= len(rows):
+            self.selected = max(0, len(rows) - 1)
+        view_h = height - 3
+        if self.selected < self.scroll:
+            self.scroll = self.selected
+        if self.selected >= self.scroll + max(1, view_h):
+            self.scroll = self.selected - view_h + 1
+        arrow = "↓" if self.sort_rev else "↑"
+        title = "процессы"
+        if self.filter or self.filtering:
+            title += "    " + self.filter + ("_" if self.filtering else "")
+        # заголовок таблицы кликабельный: cpu / ram / имя
+        labels = (("cpu", "cpu", 8), ("mem", "ram", 8), ("name", "имя", 8))
+        head_parts = [term.color(DIM) + pad("pid", 8) + term.normal]
+        col_x = {}
+        cursor = 8
+        for mode, label, width_c in labels:
+            shown = label + ((" " + arrow) if self.sort == mode else "")
+            gap = 3 if mode != "cpu" else 0
+            cursor += gap
+            col_x[mode] = cursor
+            tone = term.color(PINK) if self.sort == mode else term.color(DIM)
+            head_parts.append(" " * gap + tone + pad(shown, width_c, "right" if mode != "name" else "left") + term.normal)
+            cursor += width_c
+        head = "".join(head_parts)
+        self.sort_cols = col_x
+        body = [head]
+        name_w = max(4, inner - 30)
+        for idx, proc in enumerate(rows[self.scroll: self.scroll + view_h]):
+            abs_i = self.scroll + idx
+            mark = term.color(PINK) + "●" + term.normal if abs_i == self.selected else term.color(DIM) + "·" + term.normal
+            cpu = "    —" if proc["cpu"] is None else f"{proc['cpu']:5.1f}"
+            body.append(
+                mark + " "
+                + term.color(DIM) + pad(str(proc["pid"]), 6) + term.normal
+                + " " + color_load(term, proc["cpu"]) + pad(cpu, 6, "right") + term.normal
+                + "  " + term.color(WHITE) + pad(fmt_bytes(proc["mem"]), 8, "right") + term.normal
+                + "   " + clip(proc["name"], name_w)
+            )
+        framed = self.frame_lines(width, height, title, body)
+        return "".join(term.move_yx(y0 + i, 0) + framed[i] for i in range(len(framed)))
+
+    def fans(self, lay, snap):
+        """панель кулеров справа от процессов: полоса на каждый и кнопка авто"""
+        term = self.term
+        width = lay["fan_w"]
+        height = lay["proc_h"]
+        x0 = lay["proc_w"]
+        y0 = 1 + lay["top_h"]
+        rpm = {label: value for label, value, pwm, mode in snap["fans"]}
+        gpu = snap["gpu"]
+        rows = [
+            ("cpu", "cpu", rpm.get("cpu")),
+            ("case", "case", rpm.get("case1")),
+            ("gpu", "gpu", None if gpu is None else gpu["fan"]),
+        ]
+        inner = width - 4
+        self.zones = []
+        body = []
+        name_w, pct_w = 6, 5
+        bar_w = max(8, inner - name_w - pct_w - 8)
+        for key, title, speed in rows:
+            level = self.fan_level[key]
+            shown = "авто" if level is None else f"{level}%"
+            speed_s = "—" if speed is None else str(speed)
+            mark = term.color(PINK) + "●" + term.normal if key == self.fan_target else term.color(DIM) + "·" + term.normal
+            prefix = mark + " " + term.color(WHITE) + pad(title, name_w - 2) + term.normal + " "
+            body.append(
+                prefix
+                + self.slider(term, level, bar_w)
+                + " " + term.color(DIM) + pad(speed_s, 5, "right") + term.normal
+                + " " + term.color(PINK) + pad(shown, pct_w, "right") + term.normal
+            )
+            # зона по видимой длине, не по сырой строке: маркер и цвета иначе сдвигают клик
+            bar_x = x0 + 2 + ansi_len(prefix)
+            self.zones.append((key, bar_x, bar_x + bar_w, y0 + len(body), bar_w))
+        # кнопка авто на своей строке, кликабельная целиком
+        auto_on = all(v is None for v in self.fan_level.values())
+        body.append("")
+        bracket = term.color(PINK) if auto_on else term.color(FRAME)
+        body.append(bracket + "[ авто ]" + term.normal + term.color(DIM) + "   вернуть плате" + term.normal)
+        self.zones.append(("auto", x0 + 2, x0 + 2 + 8, y0 + len(body), 0))
+        framed = self.frame_lines(width, height, "кулеры", body)
+        return "".join(term.move_yx(y0 + i, x0) + framed[i] for i in range(len(framed)))
+
+    def footer(self, lay):
+        term = self.term
+        y = lay["h"] - 2
+        hints = "q выход     ? справка     ↑↓ список     c m n сорт     / поиск     k убить     клик по кулеру"
+        msg = self.message if self.message and time.monotonic() < self.message_until else ""
+        line1 = term.color(DIM) + "  " + pad(hints, lay["w"] - 2) + term.normal
+        line2 = term.color(PINK) + "  " + pad(msg, lay["w"] - 2) + term.normal if msg else " " * lay["w"]
+        return term.move_yx(y, 0) + line1 + term.move_yx(y + 1, 0) + line2
+
+    def help_overlay(self, lay):
+        lines = [
+            "управление",
+            "",
+            "q              выход",
+            "?              справка",
+            "↑ ↓            процессы",
+            "c  m  n        сорт по cpu, памяти, имени",
+            "клик по колонке   то же самое, повтор переворачивает",
+            "/              поиск, enter готово, esc отмена",
+            "k              завершить выбранный",
+            "",
+            "кулеры",
+            "клик по полосе    мощность от 0 до 100",
+            "клик по названию  выбрать cpu, корпус или gpu",
+            "f                 выбрать с клавиатуры",
+            "← →               шаг 5%",
+            "0                 вернуть авто",
+            "",
+            "esc закрыть",
+        ]
+        return self.modal(lay, lines, 52)
+
+    def confirm_overlay(self, lay):
+        pid, name = self.confirm
+        lines = ["завершить процесс", "", f"{pid}    {name}", "", "y да       n нет"]
+        return self.modal(lay, lines, 40)
+
+    def modal(self, lay, lines, width):
+        term = self.term
+        width = min(width, lay["w"] - 4)
+        height = len(lines) + 2
+        x = max(0, (lay["w"] - width) // 2)
+        y = max(1, (lay["h"] - height) // 2)
+        out = [term.move_yx(y, x) + term.color(PINK_DIM) + "╭" + "─" * (width - 2) + "╮" + term.normal]
+        for i, line in enumerate(lines):
+            content = pad(" " + line, width - 2)
+            out.append(
+                term.move_yx(y + 1 + i, x)
+                + term.color(PINK_DIM) + "│" + term.normal
+                + term.color(WHITE) + content + term.normal
+                + term.color(PINK_DIM) + "│" + term.normal
+            )
+        out.append(term.move_yx(y + height - 1, x) + term.color(PINK_DIM) + "╰" + "─" * (width - 2) + "╯" + term.normal)
+        return "".join(out)
+
+    def set_fan(self, arg):
+        if not os.path.isfile(FAN_BIN) or not os.access(FAN_BIN, os.X_OK):
+            self.note("fan не найден")
+            return
+        try:
+            proc = subprocess.run(
+                [FAN_BIN, *arg],
+                capture_output=True,
+                text=True,
+                timeout=4,
+            )
+        except subprocess.TimeoutExpired:
+            self.note("fan не ответил")
+            return
+        text = (proc.stdout or proc.stderr or "").strip().splitlines()
+        self.note(text[0][:80] if text else ("ок" if proc.returncode == 0 else "fan ошибка"))
+
+    def kill_selected(self):
+        if not self.proc_view:
+            return
+        proc = self.proc_view[self.selected]
+        if proc["pid"] == os.getpid():
+            self.note("себя не убиваю")
+            return
+        self.confirm = (proc["pid"], proc["name"])
+
+    def do_kill(self):
+        pid, name = self.confirm
+        self.confirm = None
+        try:
+            os.kill(pid, signal.SIGTERM)
+            self.note(f"sigterm {pid} {name}")
+        except ProcessLookupError:
+            self.note("уже нет")
+        except PermissionError:
+            self.note("нет прав")
+
+    def click(self, x, y):
+        """левый клик: колонка сорта, полоса кулера, строка процесса"""
+        lay = self.layout()
+        top = 1 + lay["top_h"]
+        # строка заголовка таблицы: рамка, потом pid/cpu/ram/имя
+        if y == top + 1 and x < lay["proc_w"]:
+            order = ("cpu", "mem", "name")
+            hit = None
+            for mode in order:
+                start = self.sort_cols.get(mode)
+                if start is not None and x >= 2 + start:
+                    hit = mode
+            if hit:
+                self.toggle_sort(hit)
+            return
+        for key, x0, x1, row, bar_w in self.zones:
+            if y != row or not x0 <= x < x1:
+                continue
+            if key == "auto":
+                self.fan_level = {"cpu": None, "case": None, "gpu": None}
+                self.set_fan(["auto"])
+                return
+            self.fan_target = key
+            span = max(1, x1 - x0)
+            pos = max(0, min(span - 1, x - x0))
+            level = int(round(pos / max(1, span - 1) * 100))
+            level = max(1, min(100, level))
+            self.fan_level[key] = level
+            self.set_fan([key, str(level)])
+            return
+        if top + 1 < y < top + lay["proc_h"] - 1 and x < lay["proc_w"] and self.proc_view:
+            # body[0] это шапка колонок, первая строка процесса на top+2
+            idx = self.scroll + (y - top - 2)
+            if 0 <= idx < len(self.proc_view):
+                self.selected = idx
+
+    def nudge_fan(self, step):
+        current = self.fan_level[self.fan_target]
+        if current is None:
+            current = 40
+        level = max(1, min(100, current + step))
+        self.fan_level[self.fan_target] = level
+        self.set_fan([self.fan_target, str(level)])
+
+    def handle(self, key):
+        if key.name and key.name.startswith("MOUSE_"):
+            # координаты только в mouse_xy. key.x у blessed нет, из-за этого клик всегда отваливался
+            if key.name == "MOUSE_LEFT":
+                x, y = key.mouse_xy
+                if x >= 0 and y >= 0:
+                    self.click(x, y)
+            return
+        if self.confirm:
+            if key in ("y", "Y"):
+                self.do_kill()
+            elif key in ("n", "N", "\x1b"):
+                self.confirm = None
+            return
+        if self.filtering:
+            if key.name == "KEY_ENTER" or key == "\n":
+                self.filtering = False
+                self.selected = 0
+                self.scroll = 0
+            elif key.name == "KEY_ESCAPE" or key == "\x1b":
+                self.filtering = False
+                self.filter = ""
+            elif key.name == "KEY_BACKSPACE" or key == "\x7f":
+                self.filter = self.filter[:-1]
+            elif key and len(key) == 1 and key.isprintable():
+                if len(self.filter) < 24:
+                    self.filter += key
+            return
+        if self.help:
+            if key in ("?", "\x1b", "q"):
+                self.help = False
+            return
+        if key in ("q", "Q"):
+            self.quit = True
+        elif key == "?":
+            self.help = True
+        elif key.name == "KEY_UP":
+            self.selected = max(0, self.selected - 1)
+        elif key.name == "KEY_DOWN":
+            self.selected = min(max(0, len(self.proc_view) - 1), self.selected + 1)
+        elif key.name == "KEY_PGUP":
+            self.selected = max(0, self.selected - 10)
+        elif key.name == "KEY_PGDOWN":
+            self.selected = min(max(0, len(self.proc_view) - 1), self.selected + 10)
+        elif key.name == "KEY_LEFT":
+            self.nudge_fan(-5)
+        elif key.name == "KEY_RIGHT":
+            self.nudge_fan(5)
+        elif key in ("c", "C"):
+            self.toggle_sort("cpu")
+        elif key in ("m", "M"):
+            self.toggle_sort("mem")
+        elif key in ("n", "N"):
+            self.toggle_sort("name")
+        elif key == "/":
+            self.filtering = True
+            self.filter = ""
+        elif key in ("k", "K"):
+            self.kill_selected()
+        elif key in ("f", "F"):
+            order = ["cpu", "case", "gpu"]
+            self.fan_target = order[(order.index(self.fan_target) + 1) % 3]
+        elif key == "0":
+            self.fan_level = {"cpu": None, "case": None, "gpu": None}
+            self.set_fan(["auto"])
+
+    def toggle_sort(self, mode):
+        if self.sort == mode:
+            self.sort_rev = not self.sort_rev
+        else:
+            self.sort = mode
+            self.sort_rev = mode != "name"
+        self.selected = 0
+        self.scroll = 0
+
+    def run(self):
+        term = self.term
+        # первый семпл без скоростей, второй сразу чтобы графики не пустовали секунду
+        self.sampler.sample()
+        time.sleep(0.15)
+        with term.fullscreen(), term.cbreak(), term.hidden_cursor(), term.mouse_enabled(timeout=0.4):
+            self.sampler.sample()
+            next_tick = time.monotonic() + INTERVAL
+            self.paint()
+            while not self.quit:
+                timeout = max(0.05, next_tick - time.monotonic())
+                key = term.inkey(timeout=timeout)
+                if key:
+                    self.handle(key)
+                now = time.monotonic()
+                if now >= next_tick:
+                    self.sampler.sample()
+                    next_tick = now + INTERVAL
+                self.paint()
+
+
+def ansi_len(text):
+    visible = 0
+    i = 0
+    while i < len(text):
+        if text[i] == "\x1b":
+            i += 1
+            if i < len(text) and text[i] == "[":
+                i += 1
+                while i < len(text) and text[i] not in "mK":
+                    i += 1
+                i += 1
+            continue
+        visible += 1
+        i += 1
+    return visible
+
+
+def fmt_pct(value):
+    if value is None:
+        return "нет"
+    return f"{value:.0f}%"
+
+
+def main():
+    if not sys.stdout.isatty():
+        print("нужен терминал")
+        return 1
+    app = App()
+    try:
+        app.run()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
