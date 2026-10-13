@@ -22,6 +22,7 @@ FAN_BIN = "/usr/local/bin/fan"
 
 # палитра: тёмный фон терминала, белый текст, розовый акцент, зелёный только на норме
 PINK = 213
+ROSE = 211
 PINK_DIM = 175
 GREEN = 71
 AMBER = 179
@@ -35,8 +36,8 @@ HOT = 203
 ACCENT = PINK
 BAR_EMPTY = 236
 
-# нагрузка: тихое -> розовое, без радуги
-GRAD = (59, 96, 139, 175, 213, 212, 211, 210, 204, 203, 196)
+# нагрузка: серое -> лиловое -> розовое -> красное, одна шкала без радуги
+GRAD = (242, 245, 139, 140, 176, 175, 213, 212, 204, 203, 196)
 # температура: зелёный пока холодно, янтарь, красный на жаре
 TEMP_GRAD = (65, 71, 149, 179, 173, 167, 203, 196)
 
@@ -699,15 +700,15 @@ class App:
         top_h -= proc_h
         gpu_h = 8 if top_h >= 18 else 0
         cpu_h = top_h - gpu_h
-        mem_h, disk_h, net_h = 6, 8, 5
-        therm_h = top_h - (mem_h + disk_h + net_h)
+        mem_h, disk_h = 6, 8
+        net_h = max(4, top_h - mem_h - disk_h)
         fan_w = max(46, w // 3)
         proc_w = w - fan_w
         return {
             "w": w, "h": h, "left": left, "right": right,
             "top_h": top_h, "proc_h": proc_h, "proc_w": proc_w, "fan_w": fan_w,
             "cpu_h": cpu_h, "gpu_h": gpu_h,
-            "mem_h": mem_h, "disk_h": disk_h, "net_h": net_h, "therm_h": therm_h,
+            "mem_h": mem_h, "disk_h": disk_h, "net_h": net_h,
         }
 
     def paint(self):
@@ -741,13 +742,13 @@ class App:
         snap = self.sampler.snap
         load = snap["load"]
         host = os.uname().nodename
-        text = f"  sysmon     {host}     xeon e3-1230 v2     rx 580     load  {load[0]:.2f}  {load[1]:.2f}  {load[2]:.2f}"
+        text = f"  stop     {host}     xeon e3-1230 v2     rx 580     load  {load[0]:.2f}  {load[1]:.2f}  {load[2]:.2f}"
         clock = time.strftime("  %H:%M:%S")
         gap = lay["w"] - len(text) - len(clock)
         if gap < 1:
             text = clip(text, lay["w"] - len(clock))
             gap = 0
-        line = term.color(PINK) + " ●" + term.color(WHITE) + text[2:] + term.normal + " " * gap + term.color(DIM) + clock + term.normal
+        line = term.color(PINK) + " ● " + term.color(WHITE) + text[3:] + term.normal + " " * gap + term.color(DIM) + clock + term.normal
         return term.move_yx(0, 0) + line
 
     def top(self, lay, snap):
@@ -848,7 +849,7 @@ class App:
         body = []
         if gpu is None:
             body.append(term.color(DIM) + "amdgpu не найден" + term.normal)
-            return self.frame_lines(width, height, "gpu  rx 580", body)
+            return self.frame_lines(width, height, "gpu", body)
         busy = None if gpu["busy"] is None else float(gpu["busy"])
         vram_pct = None
         if gpu["vram_total"] and gpu["vram_used"] is not None and gpu["vram_total"] > 0:
@@ -874,7 +875,7 @@ class App:
         tone = color_load(term, busy if busy is not None else 0)
         for line in chart:
             body.append(tone + line + term.normal)
-        return self.frame_lines(width, height, "gpu  rx 580", body)
+        return self.frame_lines(width, height, "gpu", body)
 
     def labeled(self, term, name, pct, inner, name_w, value, value_w):
         """подпись, бар и значение одной ровной строкой"""
@@ -890,7 +891,6 @@ class App:
             self.mem_block(width, lay["mem_h"], snap),
             self.disk_block(width, lay["disk_h"], snap),
             self.net_block(width, lay["net_h"], snap),
-            self.thermal_block(width, lay["therm_h"], snap),
         ]
         lines = []
         for block in blocks:
@@ -933,7 +933,7 @@ class App:
             rd, wr = snap["disks"].get(name, (None, None))
             body.append(
                 term.color(WHITE) + pad(short, 4) + term.normal
-                + "  " + term.color(GREEN) + "r" + term.normal + " " + pad(fmt_rate(rd), 8)
+                + "  " + term.color(ROSE) + "r" + term.normal + " " + pad(fmt_rate(rd), 8)
                 + "   " + term.color(PINK) + "w" + term.normal + " " + pad(fmt_rate(wr), 8)
             )
             for label_m, part, total, used in snap["disk_usage"].get(name, []):
@@ -954,7 +954,7 @@ class App:
             rx, tx = snap["net"][name]
             body.append(
                 term.color(WHITE) + pad(name, 11) + term.normal
-                + "  " + term.color(GREEN) + "↓" + term.normal + " " + pad(fmt_rate(rx), 8)
+                + "  " + term.color(ROSE) + "↓" + term.normal + " " + pad(fmt_rate(rx), 8)
                 + "   " + term.color(PINK) + "↑" + term.normal + " " + pad(fmt_rate(tx), 8)
             )
         chart_h = max(1, height - 2 - len(body))
@@ -962,28 +962,6 @@ class App:
         for line in chart:
             body.append(term.color(PINK_DIM) + line + term.normal)
         return self.frame_lines(width, height, "сеть", body)
-
-    def thermal_block(self, width, height, snap):
-        term = self.term
-        inner = width - 4
-        temps = snap["temps"]
-        chips = [("pkg", temps["package"])]
-        for label, value in temps["cores"]:
-            chips.append((label.replace("Core ", "c"), value))
-        for label, value in temps["board"]:
-            if label in {"SYSTIN": "sys", "CPUTIN": "сокет", "AUXTIN": "aux"}:
-                chips.append(({"SYSTIN": "sys", "CPUTIN": "сокет", "AUXTIN": "aux"}[label], value))
-        cell_w = max(10, (inner - 4) // 2)
-        body = []
-        pair = []
-        for label, value in chips:
-            pair.append(color_temp(term, value) + pad(f"{label}  {fmt_temp(value)}", cell_w) + term.normal)
-            if len(pair) == 2:
-                body.append(pair[0] + "    " + pair[1])
-                pair = []
-        if pair:
-            body.append(pair[0])
-        return self.frame_lines(width, height, "температуры", body)
 
     def slider(self, term, level, width):
         if level is None:
@@ -1032,7 +1010,7 @@ class App:
         for idx, proc in enumerate(rows[self.scroll: self.scroll + view_h]):
             abs_i = self.scroll + idx
             mark = term.color(PINK) + "●" + term.normal if abs_i == self.selected else term.color(DIM) + "·" + term.normal
-            cpu = "    —" if proc["cpu"] is None else f"{proc['cpu']:5.1f}"
+            cpu = "    ·" if proc["cpu"] is None else f"{proc['cpu']:5.1f}"
             body.append(
                 mark + " "
                 + term.color(DIM) + pad(str(proc["pid"]), 6) + term.normal
